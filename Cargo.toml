@@ -1,0 +1,19 @@
+[package]
+name = "esp32-azure-iot"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+anyhow = "1.0"
+
+# Gunakan versi yang saling sinkron untuk toolchain esp-1.85
+esp-idf-sys = { version = "0.35", features = ["binstart"] }
+esp-idf-hal = "0.44"
+esp-idf-svc = "0.49"
