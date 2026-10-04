@@ -1,2 +1,2 @@
 [toolchain]
-channel = "esp-1.85.0.0"
+channel = "esp"

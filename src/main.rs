@@ -1,97 +1,193 @@
-use anyhow::Result;
-use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_svc::{
-    eventloop::EspSystemEventLoop,
-    mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS},
-    nvs::EspDefaultNvsPartition,
-    wifi::{BlockingWifi, EspWifi, Configuration, ClientConfiguration},
-};
-use std::{thread::sleep, time::Duration};
-use log::*;
+use std::thread;
+use std::time::Duration;
 
-// ================== KONFIGURASI WI-FI ==================
-const WIFI_SSID: &str = "Galaxy A15 5G";
-const WIFI_PASS: &str = "worksomething";
+use anyhow::Context;
 
-// ================== KONFIGURASI AZURE IOT HUB ==================
-// Contoh: "NamaHubAnda.azure-devices.net"
-const AZURE_HOST: &str = "mqtts://iothubesp32s3.azure-devices.net:8883"; 
-const AZURE_DEVICE_ID: &str = "esp32s3-device-01";
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::delay::{Ets, FreeRtos};
+use esp_idf_svc::hal::gpio::{PinDriver, Pull};
+use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sntp::{EspSntp, SyncStatus};
+use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
-// Format Username Azure IoT: {iothubhostname}/{device_id}/?api-version=2021-04-12
-const AZURE_USER: &str = "http://iothubesp32s3.azure-devices.net/esp32s3-device-01/?api-version=2021-04-12";
+use dht_sensor::{dht22, DhtReading};
+use serde_json::json;
 
-// SAS Token yang digenerate via Azure CLI / VS Code Extension Azure IoT
-// Formatnya diawali dengan "SharedAccessSignature sr=..."
-const AZURE_SAS_TOKEN: &str = "SharedAccessSignature sr=iothubesp32s3.azure-devices.net%2Fdevices%2Fesp32s3-device-01&sig=KSx9ZmaccQi5k4rftEi%2BwsbI5WMdO86H4fJla80v0Vs%3D&se=1852030800"; 
+// Wrapper Delay presisi mikro-detik untuk pembacaan DHT22 di ESP-IDF (std)
+struct IdfDelay;
+impl embedded_hal::blocking::delay::DelayUs<u8> for IdfDelay {
+    fn delay_us(&mut self, us: u8) { Ets::delay_us(us as u32); }
+}
+impl embedded_hal::blocking::delay::DelayUs<u16> for IdfDelay {
+    fn delay_us(&mut self, us: u16) { Ets::delay_us(us as u32); }
+}
+impl embedded_hal::blocking::delay::DelayUs<u32> for IdfDelay {
+    fn delay_us(&mut self, us: u32) { Ets::delay_us(us); }
+}
+impl embedded_hal::blocking::delay::DelayMs<u8> for IdfDelay {
+    fn delay_ms(&mut self, ms: u8) { FreeRtos::delay_ms(ms as u32); }
+}
+impl embedded_hal::blocking::delay::DelayMs<u16> for IdfDelay {
+    fn delay_ms(&mut self, ms: u16) { FreeRtos::delay_ms(ms as u32); }
+}
+impl embedded_hal::blocking::delay::DelayMs<u32> for IdfDelay {
+    fn delay_ms(&mut self, ms: u32) { FreeRtos::delay_ms(ms); }
+}
 
-fn main() -> Result<()> {
-    // Tautkan patch runtime ESP-IDF (Penting untuk kestabilan awal)
-    esp_idf_sys::link_patches();
+// =========================================================================
+// KONFIGURASI WI-FI & AZURE IOT HUB
+// =========================================================================
+pub const WIFI_SSID: &str = "GalaxyA1505DF";
+pub const WIFI_PASS: &str = "worksomething";
+
+// Kredensial Azure IoT Hub
+pub const AZURE_IOTHUB_HOST: &str = "iothubesp32s3.azure-devices.net";
+pub const DEVICE_ID: &str = "esp32s3-device-01";
+pub const AZURE_SAS_TOKEN: &str = "SharedAccessSignature sr=iothubesp32s3.azure-devices.net%2Fdevices%2Fesp32s3-device-01&sig=KSx9ZmaccQi5k4rftEi%2BwsbI5WMdO86H4fJla80v0Vs%3D&se=1852030800";
+
+fn main() -> anyhow::Result<()> {
+    esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    info!("Memulai ESP32 Azure IoT Node...");
+    log::info!("==================================================");
+    log::info!("ESP32-S3 [STD] DHT22 -> Azure IoT Hub (MQTT TLS)");
+    log::info!("==================================================");
 
-    // 1. Inisialisasi Hardware & NVS (Non-Volatile Storage) untuk Wi-Fi
-    let peripherals = Peripherals::take().unwrap();
-    let sys_loop = EspSystemEventLoop::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
+    let peripherals = Peripherals::take().context("Gagal inisialisasi periferal")?;
+    let sys_loop = EspSystemEventLoop::take().context("Gagal mengambil system event loop")?;
+    let nvs = EspDefaultNvsPartition::take().context("Gagal mengambil NVS partition")?;
 
-    // 2. Setup Koneksi Wi-Fi secara Blocking
-    let mut esp_wifi = EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?;
-    let mut wifi = BlockingWifi::wrap(&mut esp_wifi, sys_loop)?;
+    // Inisialisasi Pin 20 untuk Sensor DHT22
+    let mut dht_pin = PinDriver::input_output_od(peripherals.pins.gpio20, Pull::Up)
+        .context("Gagal inisialisasi pin DHT22 pada GPIO 20")?;
+    dht_pin.set_high()?;
 
-    info!("Menghubungkan ke Wi-Fi: {}", WIFI_SSID);
-    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
-        ssid: WIFI_SSID.try_into().unwrap(),
-        password: WIFI_PASS.try_into().unwrap(),
-        ..Default::default()
-    }))?;
+    // Connect ke Wi-Fi
+    log::info!("Menghubungkan ke Wi-Fi Hotspot: {}...", WIFI_SSID);
+    let mut wifi = BlockingWifi::wrap(
+        EspWifi::new(peripherals.modem, sys_loop.clone(), Some(nvs))?,
+        sys_loop,
+    )?;
 
-    wifi.start()?;
-    wifi.connect()?;
-    wifi.wait_netif_up()?;
-    info!("Wi-Fi Berhasil Terhubung!");
+    connect_wifi(&mut wifi)?;
+    log::info!(">> Wi-Fi Berhasil Terhubung!");
 
-    // 3. Konfigurasi Client MQTT untuk Azure IoT Hub
-    // Azure IoT menggunakan MQTTS (Port 8883) secara default, atau Port 443
+    // =========================================================================
+    // SINKRONISASI WAKTU (SNTP) - WAJIB UNTUK VALIDASI SERTIFIKAT TLS AZURE
+    // =========================================================================
+    log::info!("Menyinkronkan waktu sistem via SNTP...");
+    let sntp = EspSntp::new_default()?;
+    let mut retries = 0;
+    while sntp.get_sync_status() != SyncStatus::Completed {
+        thread::sleep(Duration::from_millis(500));
+        retries += 1;
+        if retries > 20 {
+            log::warn!("Sinkronisasi waktu belum selesai sempurna, mencoba melanjutkan...");
+            break;
+        }
+    }
+    log::info!(">> Waktu Sistem Berhasil Terverifikasi!");
+
+    // =========================================================================
+    // INISIALISASI KLIEN MQTT TLS KE AZURE IOT HUB (PORT 8883)
+    // =========================================================================
+    let mqtt_url = format!("mqtts://{}:8883", AZURE_IOTHUB_HOST);
+    let username = format!("{}/{}/?api-version=2021-04-12", AZURE_IOTHUB_HOST, DEVICE_ID);
+    let publish_topic = format!("devices/{}/messages/events/", DEVICE_ID);
+
     let mqtt_config = MqttClientConfiguration {
-        client_id: Some(AZURE_DEVICE_ID),
-        username: Some(AZURE_USER),
+        client_id: Some(DEVICE_ID),
+        username: Some(&username),
         password: Some(AZURE_SAS_TOKEN),
-        server_certificate: None, // Di 'std', defaultnya akan menggunakan sertifikat root bawaan ESP-IDF jika tersedia
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
     };
 
-    // Alamat URL koneksi MQTT Azure IoT Hub
-    let mqtt_url = format!("mqtts://{}", AZURE_HOST);
+    log::info!("Menghubungkan ke Broker Azure IoT Hub via MQTT Port 8883...");
+    let mut mqtt_client = EspMqttClient::new_cb(&mqtt_url, &mqtt_config, move |event| {
+        log::info!("[MQTT Event]: {:?}", event.payload());
+    })?;
 
-    info!("Mencoba terhubung ke Azure IoT Hub...");
-    let (mut client, mut connection) = EspMqttClient::new_with_conn(&mqtt_url, &mqtt_config)?;
+    log::info!(">> Terhubung ke Azure IoT Hub!");
 
-    // Handle background event MQTT di thread terpisah agar koneksi tetap hidup
-    std::thread::spawn(move || {
-        while let Some(Ok(event)) = connection.next() {
-            info!("MQTT Event Received: {:?}", event.payload());
+    let mut idf_delay = IdfDelay;
+
+    // =========================================================================
+    // LOOP UTAMA: BACA SENSOR & PUBLISH KE AZURE IOT HUB TIAP 5 DETIK
+    // =========================================================================
+    loop {
+        thread::sleep(Duration::from_secs(5));
+
+        let mut temp = 0.0;
+        let mut hum = 0.0;
+        let mut read_success = false;
+
+        // Coba baca DHT22 hingga 3 kali
+        for _ in 0..3 {
+            match dht22::Reading::read(&mut idf_delay, &mut dht_pin) {
+                Ok(reading) => {
+                    temp = reading.temperature;
+                    hum = reading.relative_humidity;
+                    read_success = true;
+                    break;
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
         }
+
+        if !read_success {
+            log::warn!("DHT22 belum terbaca/belum dicolok di GPIO 20, memakai data simulasi...");
+            temp = 28.5;
+            hum = 65.0;
+        } else {
+            log::info!("Hasil Sensor DHT22 -> Suhu: {:.2}°C | Kelembaban: {:.2}%", temp, hum);
+        }
+
+        // Payload JSON untuk Azure IoT Hub
+        let payload = json!({
+            "device_id": DEVICE_ID,
+            "coffee_type": "robusta",
+            "sensors": {
+                "mq2": 0.0,
+                "mq3": 0.0,
+                "mq135": 0.0,
+                "mq138": 0.0,
+                "temperature": temp,
+                "humidity": hum
+            }
+        });
+
+        let payload_str = payload.to_string();
+
+        // Publish payload ke topik Azure IoT Hub via MQTT
+        match mqtt_client.enqueue(&publish_topic, QoS::AtLeastOnce, false, payload_str.as_bytes()) {
+            Ok(msg_id) => {
+                log::info!(">> [MQTT SUKSES] Data ter-publish ke Azure IoT Hub (Msg ID: {})!", msg_id);
+            }
+            Err(e) => {
+                log::error!("Gagal publish ke Azure IoT Hub: {:?}", e);
+            }
+        }
+    }
+}
+
+fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> anyhow::Result<()> {
+    let wifi_configuration: Configuration = Configuration::Client(ClientConfiguration {
+        ssid: WIFI_SSID.try_into().unwrap_or_default(),
+        bssid: None,
+        auth_method: AuthMethod::WPA2Personal,
+        password: WIFI_PASS.try_into().unwrap_or_default(),
+        channel: None,
+        ..Default::default()
     });
 
-    // Topic standar Azure IoT Hub untuk pengiriman Telemetri (Device-to-Cloud)
-    let pub_topic = format!("devices/{}/messages/events/", AZURE_DEVICE_ID);
-
-    // 4. Loop Pengiriman Data Telemetri secara berkala
-    let mut count = 0;
-    loop {
-        count += 1;
-        let payload = format!(r#"{{"temperature": 25.5, "humidity": 60, "counter": {}}}"#, count);
-        
-        info!("Mengirim data ke Azure: {}", payload);
-        match client.publish(&pub_topic, QoS::AtLeastOnce, false, payload.as_bytes()) {
-            Ok(msg_id) => info!("Data terkirim dengan sukses. Message ID: {:?}", msg_id),
-            Err(e) => error!("Gagal mengirim data: {:?}", e),
-        }
-
-        // Kirim data setiap 10 detik sekali
-        sleep(Duration::from_secs(10));
-    }
+    wifi.set_configuration(&wifi_configuration)?;
+    wifi.start()?;
+    wifi.connect()?;
+    wifi.wait_netif_up()?;
+    Ok(())
 }

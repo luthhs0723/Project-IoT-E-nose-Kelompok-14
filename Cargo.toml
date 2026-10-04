@@ -1,19 +1,31 @@
 [package]
-name = "esp32-azure-iot"
+name = "iot"
 version = "0.1.0"
+authors = ["Axioo"]
 edition = "2021"
+resolver = "2"
+rust-version = "1.82"
+
+[[bin]]
+name = "iot"
+harness = false
 
 [profile.release]
 opt-level = "s"
 
 [profile.dev]
+debug = true
 opt-level = "z"
 
 [dependencies]
 log = "0.4"
+esp-idf-svc = "0.52.1"
+embedded-svc = "0.29"
 anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+embedded-hal = "0.2.7"
+dht-sensor = "0.2.1"
 
-# Gunakan versi yang saling sinkron untuk toolchain esp-1.85
-esp-idf-sys = { version = "0.35", features = ["binstart"] }
-esp-idf-hal = "0.44"
-esp-idf-svc = "0.49"
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }
